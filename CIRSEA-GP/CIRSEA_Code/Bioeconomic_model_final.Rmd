@@ -1,0 +1,1083 @@
+---
+title: "Bioeconomic_Model_Final_Draft"
+author: "Ashley Cooper"
+date: "2024-03-14"
+output:
+    html_document:
+      theme: flatly
+      code_folding: hide
+
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(nloptr)
+library(knitr)
+library(kableExtra)
+library(dplyr)
+library(ggplot2)
+library(cowplot)
+library(scales)
+library(patchwork)
+library(gridExtra)
+```
+
+*int stock* = initial biomass (MT)
+
+$X_t$ = fish stock (MT) at time *t*
+
+$h_t$ = quota, or legal fishing effort (MT)
+
+$discount (\delta)$ = .05
+
+$p$ = price of landed fish (per MT)
+
+$c$ = cost of fishing (per MT)
+
+$\alpha$ = cost of enforcement
+
+$e_{t}$ = enforcement effort at time *t*
+
+$\gamma$ = enforcement effectiveness
+
+$K$ = carrying capacity
+
+$r$ = intrinsic population growth rate
+
+**Stock Equation**
+
+$$
+X_{t+1} = X_{t} + r*X_{t} - \frac{r *(X_{t})^2}{K} -(h_t)
+$$
+
+**Benefits Function**
+
+$$
+\pi_t = p*(h_t) - c * \frac{(h_t)^2}{X_t}
+$$
+
+### Parameters
+
+```{r}
+### Time parameters
+T = 20 #time horizon for backward induction; t is the equivalent of i, and is used for while-loops
+discount <- 0.05
+delta <- 1/(1+discount)
+
+
+### Biological parameters
+K <- 2265128
+r <- 0.2
+int_stock <- 883400 # initial stock biomass (MT)
+grid_start <- K/1000000 # guess for xgrid in optimal policy/value functions
+
+### Economic parameters
+p <- 2397
+c <- 1678
+
+### Enforcement parameters
+enfVec <- seq(0, 1, .1) # Enforcement vector from 0 to 1, with 0 being no enforcement and 1 being full enforcement
+enfDet <- c(0, .04, .25, .38, .47, .54, .59, .64, .68, .72, .75)/3 # Taken from McDonald et al. code
+fine <- p * 3.5
+
+
+### Iteration parameters
+sizex = 100 # size of the state grid; setting equal to Chris C's example
+xgrid <- seq(grid_start, K, length.out = sizex)
+
+tol_ht = .01 # tolerance value for fishing effort optimization
+tol_e = .01 # tolerance value for enforcement effort optimization
+```
+
+### Dynamic Optimal Harvest w/ Value Function Iteration (VFI)
+
+#### Value Function Iteration
+
+
+```{r, results=FALSE}
+### Stock function
+stock_growth_fun <- function(h, X)
+{
+  Xnext = X + (r * X) - (r * X^2)/K - h
+  if (X < 0) Xnext = 0
+  return (Xnext)
+}
+
+### Profits function
+profit_legal <- function(h, X)
+{
+  benefit = p*h - c * (h^2)/X
+}
+
+### Payoff function to get long-term benefits. V = Value
+payoff <- function(X, h, V)
+{
+  Xnext = stock_growth_fun(h, X)
+  Vnext = spline(x = xgrid, y = V, xout = Xnext)
+  neg_out = -(profit_legal(h,X) + delta * Vnext$y) # sum of current profit + discounted future value of fish
+  return(neg_out) # negative because of optimization
+}
+
+DFall = data.frame()
+Vnext = vector()
+V = seq(0, 0, length.out = sizex) # Setting V = 0
+
+### Payoff function
+
+optimzation_1 <- for(t in T:1)
+{
+  print(t)
+  
+  for(i in 1:length(xgrid))
+  {
+    X = xgrid[i]
+    guess = 10
+    low = 0 # lower bound on harvest
+    high = X + (r * X) - (r * X^2)/K # upper bound; harvest cannot exceed stock (growth?). could also try high = X
+    Thing = optim(par = guess, fn = payoff, lower = low, upper = high, X = X, V = V, method = 'L-BFGS-B')
+    hstar = Thing$par #optimal harvest, or quota
+    Vstar = -Thing$value #optimal value
+    Vnext[i] = Vstar
+    
+    ### now use dataframe to store information
+    DFnow = data.frame(time = t, X = X, hstar = hstar, Vstar = Vstar)
+    DFall = bind_rows(DFall, DFnow)
+  } # end for loop
+  
+  V = Vnext # tells the model to iterate
+}
+```
+
+
+#### Forward Simulation
+
+
+```{r}
+### Forward simulation, choosing time 1 (convergence) as the time
+
+DFopt <- DFall %>% 
+  filter(time==1)
+
+
+hpol = DFopt$hstar #optimal harvest policy
+xpol = DFopt$X
+xsim = vector()
+hsim = vector()
+
+xsim[1] = int_stock  # Elected to start with int_stock because this is the starting biomass of yellowfin tuna at the time of model creation
+Tsim = seq(1, 20)
+
+for(tt in Tsim)
+{
+  Thing = spline(x = xpol, y = hpol, xout = xsim[tt])
+  hsim[tt] = Thing$y
+  if(tt < max(Tsim))
+  {
+   xsim[tt+1] = stock_growth_fun(h = hsim[tt], X = xsim[tt]) 
+  }
+}
+
+DFsimulation <- data.frame(time = Tsim, xsim = xsim, hsim = hsim) %>% 
+  mutate(enfE = rep("Optimal", 20)) %>% 
+  mutate(stock = round(xsim)) %>% 
+  mutate(legal = round(spline(x = DFopt$X, y = DFopt$hstar, xout = xsim)$y)) %>% 
+  mutate(legal = ifelse(legal > hsim, round(hsim), legal)) %>% 
+  mutate(illegal = round(hsim - legal)) %>% 
+  mutate(illegal = ifelse(illegal < 0, 0, illegal)) %>% 
+  mutate(total = legal + illegal)
+```
+
+
+### Introduce Illegal Fishing
+
+
+#### Starting Functions
+
+
+```{r}
+### Adapted from profitOptimEnf (Optimization to determine vector of optimal fishing effort and optimal enforcement effort based on B/BMSY)
+
+### Fine function
+fine_fun <- function(ht, h)
+  {
+  if (ht > h)
+    {expected_fine = spline(enfVec, enfDet, xout = enforcement)$y * (ht - h) * fine}
+      
+    else 
+      {expected_fine = 0}
+  
+    return(expected_fine)
+}
+
+### Social profit function
+profit_social_fun <- function(ht, h, X)
+  {
+  if (X == 0)
+    {profit = 0}
+  
+  else
+    {profit = p * ht - c * ht^2/X - fine_fun(ht, h)}
+  
+  return(profit)
+}
+
+### Function to find the approximate hstar value in DFopt for a given stock level X
+approx_hstar_fun <- function(X)
+  {
+  if (any(X == 0)) 
+    {approx_hstar = 0}
+  
+  else
+    {approx_hstar = spline(x = DFopt$X, y = DFopt$hstar, xout = X)$y}
+  
+  return(approx_hstar)
+}
+
+payoff_illegal <- function(ht, X, V2)
+{
+  Xnext = stock_growth_fun(ht, X)
+  Vnext = spline(x = xgrid, y = V2, xout = Xnext)
+  # neg_out = -(profit_social_fun(ht, h = approx_hstar_fun(X), X) + delta * Vnext$y)
+  neg_out = -(profit_social_fun(ht, h = approx_hstar_fun(X), X))
+  return(neg_out)
+}
+```
+
+
+### Enforcment = 0
+
+```{r, results=FALSE}
+### VFI
+
+#### Payoff function
+
+enforcement <- 0
+
+DFall_illegal_0e = data.frame()
+Vnext_illegal_0e = vector
+V2 = seq(0, 0, length.out = sizex)
+
+actual_optimization <- for(t in T:1)
+{
+  print(t)
+  
+  for(i in 1:length(xgrid))
+  {
+    X = xgrid[i]
+    guess = 10
+    
+    Fishes = optim(par = guess,
+                   fn = payoff_illegal,
+                   lower = 0,
+                   upper = X,
+                   X = X,
+                   V2 = V2,
+                   method = 'L-BFGS-B')
+    
+    hactual = Fishes$par # Actual harvest
+    value = -Fishes$value # Value of the actual harvest
+    Vnext[i] = value
+    
+    ### DF to store information to store information
+    DFnow_illegal_0e = data.frame(time = t, X = X, hactual = hactual, value = value)
+    DFall_illegal_0e = bind_rows(DFall_illegal_0e, DFnow_illegal_0e)
+  }
+
+  V2 = Vnext # tells the model to iterate  
+
+}
+```
+
+
+```{r}
+#### Forward Simulation
+
+DF_opt_illegal_0e <- DFall_illegal_0e %>% 
+  filter(time == 1)
+
+xsim2 = vector()
+hsim2 = vector()
+
+xsim2[1] = int_stock
+Tsim = seq(1, 20)
+
+for(t in Tsim)
+{
+  Fishes2 = spline(x = DF_opt_illegal_0e$X, y = DF_opt_illegal_0e$hactual, xout = xsim2[t])
+  hsim2[t] = Fishes2$y
+  if(t < max(Tsim))
+  {
+   xsim2[t+1] = stock_growth_fun(h = hsim2[t], X = xsim2[t]) 
+  }
+}
+
+DFsimulation_0e <- data.frame(time = Tsim, xsim = xsim2, hsim = hsim2) %>% 
+  mutate(enfE = rep("0", 20)) %>% 
+  mutate(stock = round(xsim)) %>% 
+  mutate(legal = round(spline(x = DFopt$X, y = DFopt$hstar, xout = xsim)$y)) %>% 
+  mutate(legal = ifelse(legal > hsim, round(hsim), legal)) %>% 
+  mutate(illegal = round(hsim - legal)) %>% 
+  mutate(illegal = ifelse(illegal < 0, 0, illegal)) %>% 
+  mutate(total = legal + illegal)
+```
+
+
+### Enforcement = 0.25
+
+```{r, results=FALSE}
+### VFI
+
+#### Payoff function
+enforcement <- 0.25
+
+DFall_illegal_0.25e = data.frame()
+Vnext_illegal_0.25e = vector
+V2 = seq(0, 0, length.out = sizex)
+
+actual_optimization <- for(t in T:1)
+{
+  print(t)
+  
+  for(i in 1:length(xgrid))
+  {
+    X = xgrid[i]
+    guess = 10
+    
+    Fishes = optim(par = guess,
+                   fn = payoff_illegal,
+                   lower = 0,
+                   upper = X,
+                   X = X,
+                   V2 = V2,
+                   method = 'L-BFGS-B')
+    
+    hactual = Fishes$par # Actual harvest
+    value = -Fishes$value # Value of the actual harvest
+    Vnext[i] = value
+    
+    ### DF to store information to store information
+    DFnow_illegal_0.25e = data.frame(time = t, X = X, hactual = hactual, value = value)
+    DFall_illegal_0.25e = bind_rows(DFall_illegal_0.25e, DFnow_illegal_0.25e)
+  }
+
+  V2 = Vnext # tells the model to iterate  
+
+}
+
+
+#### Forward Simulation
+
+DF_opt_illegal_0.25e <- DFall_illegal_0.25e %>% 
+  filter(time == 1)
+
+xsim2 = vector()
+hsim2 = vector()
+
+xsim2[1] = int_stock
+Tsim = seq(1, 20)
+
+for(t in Tsim)
+{
+  Fishes2 = spline(x = DF_opt_illegal_0.25e$X, y = DF_opt_illegal_0.25e$hactual, xout = xsim2[t])
+  hsim2[t] = Fishes2$y
+  if(t < max(Tsim))
+  {
+   xsim2[t+1] = stock_growth_fun(h = hsim2[t], X = xsim2[t]) 
+  }
+}
+
+DFsimulation_0.25e <- data.frame(time = Tsim, xsim = xsim2, hsim = hsim2) %>% 
+  mutate(enfE = rep("0.25", 20)) %>% 
+  mutate(stock = round(xsim)) %>% 
+  mutate(legal = round(spline(x = DFopt$X, y = DFopt$hstar, xout = xsim)$y)) %>% 
+  mutate(legal = ifelse(legal > hsim, round(hsim), legal)) %>% 
+  mutate(illegal = round(hsim - legal)) %>% 
+  mutate(illegal = ifelse(illegal < 0, 0, illegal)) %>% 
+  mutate(total = legal + illegal)
+```
+
+
+### Enforcement = 0.5
+
+```{r, results=FALSE}
+### VFI
+
+#### Payoff function
+enforcement <- 0.5
+
+DFall_illegal_0.5e = data.frame()
+Vnext_illegal_0.5e = vector
+V2 = seq(0, 0, length.out = sizex)
+
+actual_optimization <- for(t in T:1)
+{
+  print(t)
+  
+  for(i in 1:length(xgrid))
+  {
+    X = xgrid[i]
+    guess = 10
+    
+    Fishes = optim(par = guess,
+                   fn = payoff_illegal,
+                   lower = 0,
+                   upper = X,
+                   X = X,
+                   V2 = V2,
+                   method = 'L-BFGS-B')
+    
+    hactual = Fishes$par # Actual harvest
+    value = -Fishes$value # Value of the actual harvest
+    Vnext[i] = value
+    
+    ### DF to store information to store information
+    DFnow_illegal_0.5e = data.frame(time = t, X = X, hactual = hactual, value = value)
+    DFall_illegal_0.5e = bind_rows(DFall_illegal_0.5e, DFnow_illegal_0.5e)
+  }
+
+  V2 = Vnext # tells the model to iterate  
+
+}
+
+
+#### Forward Simulation
+
+DF_opt_illegal_0.5e <- DFall_illegal_0.5e %>% 
+  filter(time == 1)
+
+xsim2 = vector()
+hsim2 = vector()
+
+xsim2[1] = int_stock
+Tsim = seq(1, 20)
+
+for(t in Tsim)
+{
+  Fishes2 = spline(x = DF_opt_illegal_0.5e$X, y = DF_opt_illegal_0.5e$hactual, xout = xsim2[t])
+  hsim2[t] = Fishes2$y
+  if(t < max(Tsim))
+  {
+   xsim2[t+1] = stock_growth_fun(h = hsim2[t], X = xsim2[t]) 
+  }
+}
+
+DFsimulation_0.5e <- data.frame(time = Tsim, xsim = xsim2, hsim = hsim2) %>%
+  mutate(enfE = rep("0.5", 20)) %>% 
+  mutate(stock = round(xsim)) %>% 
+  mutate(legal = round(spline(x = DFopt$X, y = DFopt$hstar, xout = xsim)$y)) %>% 
+  mutate(legal = ifelse(legal > hsim, round(hsim), legal)) %>% 
+  mutate(legal = ifelse(legal < 0, 0, legal)) %>% 
+  mutate(illegal = round(hsim - legal)) %>% 
+  mutate(illegal = ifelse(illegal > hsim, round(hsim), illegal)) %>% 
+  mutate(illegal = ifelse(illegal < 0, 0, illegal)) %>% 
+  mutate(total = legal + illegal)
+```
+
+
+### Enforcement = 0.75
+
+```{r, results=FALSE}
+### VFI
+
+#### Payoff function
+enforcement <- 0.75
+
+DFall_illegal_0.75e = data.frame()
+Vnext_illegal_0.75e = vector
+V2 = seq(0, 0, length.out = sizex)
+
+actual_optimization <- for(t in T:1)
+{
+  print(t)
+  
+  for(i in 1:length(xgrid))
+  {
+    X = xgrid[i]
+    guess = 10
+    
+    Fishes = optim(par = guess,
+                   fn = payoff_illegal,
+                   lower = 0,
+                   upper = X,
+                   X = X,
+                   V2 = V2,
+                   method = 'L-BFGS-B')
+    
+    hactual = Fishes$par # Actual harvest
+    value = -Fishes$value # Value of the actual harvest
+    Vnext[i] = value
+    
+    ### DF to store information to store information
+    DFnow_illegal_0.75e = data.frame(time = t, X = X, hactual = hactual, value = value)
+    DFall_illegal_0.75e = bind_rows(DFall_illegal_0.75e, DFnow_illegal_0.75e)
+  }
+
+  V2 = Vnext # tells the model to iterate  
+
+}
+
+
+#### Forward Simulation
+
+DF_opt_illegal_0.75e <- DFall_illegal_0.75e %>% 
+  filter(time == 1)
+
+xsim2 = vector()
+hsim2 = vector()
+
+xsim2[1] = int_stock
+Tsim = seq(1, 20)
+
+for(t in Tsim)
+{
+  Fishes2 = spline(x = DF_opt_illegal_0.75e$X, y = DF_opt_illegal_0.75e$hactual, xout = xsim2[t])
+  hsim2[t] = Fishes2$y
+  if(t < max(Tsim))
+  {
+   xsim2[t+1] = stock_growth_fun(h = hsim2[t], X = xsim2[t]) 
+  }
+}
+
+DFsimulation_0.75e <- data.frame(time = Tsim, xsim = xsim2, hsim = hsim2) %>% 
+  mutate(enfE = rep("0.75", 20)) %>% 
+  mutate(stock = round(xsim)) %>% 
+  mutate(legal = round(spline(x = DFopt$X, y = DFopt$hstar, xout = xsim)$y)) %>% 
+  mutate(legal = ifelse(legal > hsim, round(hsim), legal)) %>% 
+  mutate(illegal = round(hsim - legal)) %>% 
+  mutate(illegal = ifelse(illegal < 0, 0, illegal)) %>% 
+  mutate(total = legal + illegal)
+```
+
+### Enforcement = 1
+
+
+```{r, results=FALSE}
+### VFI
+
+#### Payoff function
+enforcement <- 1
+
+DFall_illegal_1e = data.frame()
+Vnext_illegal_1e = vector
+V2 = seq(0, 0, length.out = sizex)
+
+actual_optimization <- for(t in T:1)
+{
+  print(t)
+  
+  for(i in 1:length(xgrid))
+  {
+    X = xgrid[i]
+    guess = 10
+    
+    Fishes = optim(par = guess,
+                   fn = payoff_illegal,
+                   lower = 0,
+                   upper = X,
+                   X = X,
+                   V2 = V2,
+                   method = 'L-BFGS-B')
+    
+    hactual = Fishes$par # Actual harvest
+    value = -Fishes$value # Value of the actual harvest
+    Vnext[i] = value
+    
+    ### DF to store information to store information
+    DFnow_illegal_1e = data.frame(time = t, X = X, hactual = hactual, value = value)
+    DFall_illegal_1e = bind_rows(DFall_illegal_1e, DFnow_illegal_1e)
+  }
+
+  V2 = Vnext # tells the model to iterate  
+
+}
+
+
+#### Forward Simulation
+
+DF_opt_illegal_1e <- DFall_illegal_1e %>% 
+  filter(time == 1)
+
+xsim2 = vector()
+hsim2 = vector()
+
+xsim2[1] = int_stock
+Tsim = seq(1, 20)
+
+for(t in Tsim)
+{
+  Fishes2 = spline(x = DF_opt_illegal_1e$X, y = DF_opt_illegal_1e$hactual, xout = xsim2[t])
+  hsim2[t] = Fishes2$y
+  if(t < max(Tsim))
+  {
+   xsim2[t+1] = stock_growth_fun(h = hsim2[t], X = xsim2[t]) 
+  }
+}
+
+DFsimulation_1e <- data.frame(time = Tsim, xsim = xsim2, hsim = hsim2) %>%
+  mutate(enfE = rep("1", 20)) %>% 
+  mutate(stock = round(xsim)) %>% 
+  mutate(legal = round(spline(x = DFopt$X, y = DFopt$hstar, xout = xsim)$y)) %>% 
+  mutate(legal = ifelse(legal > hsim, round(hsim), legal)) %>% 
+  mutate(illegal = round(hsim - legal)) %>% 
+  mutate(illegal = ifelse(illegal < 0, 0, illegal)) %>% 
+  mutate(total = legal + illegal)
+```
+
+
+### Visuals
+
+
+#### Policy Function
+
+
+```{r, warning=FALSE}
+policy_harvest_plot <- ggplot(data = DFall) +
+  geom_path(aes(x = X, y = hstar, color = factor(time)), size = 1.3) +
+  xlab("Stock (MT)") +
+  ylab("Harvest (MT)") +
+  scale_x_continuous(label=comma) +
+  scale_y_continuous(label=comma) +
+  scale_color_viridis_d() +
+  ggtitle(stringr::str_wrap("Indian Ocean Yellowfin Tuna: Policy Function", width=30)) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+policy_harvest_plot <- policy_harvest_plot +
+  theme(legend.position = "none")
+
+policy_harvest_plot_final <- plot_grid(policy_harvest_plot,
+                                       ncol = 1,
+                                       nrow = 1,
+                                       # labels = c("A"),
+                                       label_fontfamily = "calibri",
+                                       label_fontface = "plain")
+
+policy_harvest_plot_final
+```
+
+
+#### Value Function
+
+```{r}
+policy_value_plot <- ggplot(data = DFall) +
+  geom_path(aes(x = X, y = Vstar, color = factor(time)), size = 1.3) + #value
+  xlab("Stock (MT)") +
+  ylab("Value") +
+  scale_y_continuous(label=comma) +
+  scale_x_continuous(label=comma) +
+  scale_color_viridis_d() +
+  ggtitle(stringr::str_wrap("Indian Ocean Yellowfin Tuna: Value Function", width=30)) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+policy_value_plot <- policy_value_plot +
+  theme(legend.position = "none")
+
+policy_value_plot
+
+policy_value_plot_final <- plot_grid(policy_value_plot,
+                                       ncol = 1,
+                                       nrow = 1,
+                                       # labels = c("B"),
+                                       label_fontfamily = "calibri",
+                                       label_fontface = "plain")
+
+policy_value_plot_final
+```
+
+
+#### Optimal Stock Growth
+
+```{r}
+opt_stock_plot <- ggplot(data = DFsimulation) +
+  geom_line(aes(x = time, y = xsim), color = "skyblue", size = 1.7) +
+  geom_point(aes(x = time, y = xsim), color = "purple4") +
+  xlab("Year") +
+  ylab("Stock (MT)") +
+  scale_y_continuous(label=comma) +
+  ggtitle(stringr::str_wrap("Indian Ocean Yellowfin Tuna: Optimal Stock Growth", width=30)) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+opt_stock_plot
+
+opt_stock_plot_final <- plot_grid(opt_stock_plot,
+                                       ncol = 1,
+                                       nrow = 1,
+                                       labels = c("C"),
+                                       label_fontfamily = "calibri",
+                                       label_fontface = "plain")
+
+opt_stock_plot_final
+```
+
+
+#### Optimal Harvest Policy
+
+```{r}
+opt_harvest_plot <- ggplot(data = DFsimulation) +
+  geom_line(aes(x = time, y = hsim), color = "skyblue", size = 1.7) +
+  geom_point(aes(x = time, y = hsim), color = "purple4") +
+  xlab("Year") +
+  ylab("Harvest (MT)") +
+  scale_y_continuous(label=comma) +
+  ggtitle(stringr::str_wrap("Indian Ocean Yellowfin Tuna: Optimal Harvest", width=30)) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+opt_harvest_plot
+
+opt_harvest_plot_final <- plot_grid(opt_harvest_plot,
+          ncol = 1,
+          nrow = 1,
+          labels = c("D"),
+          label_fontfamily = "calibri",
+          label_fontface = "plain")
+
+opt_harvest_plot_final
+```
+
+
+#### All Stocks
+
+
+```{r, warning=FALSE}
+DFsimulation_all <- bind_rows(DFsimulation, 
+                     DFsimulation_0e, 
+                     DFsimulation_0.25e, 
+                     DFsimulation_0.5e, 
+                     DFsimulation_0.75e, 
+                     DFsimulation_1e)
+
+
+DFsimulation_enf <- DFsimulation_all %>% 
+  filter(enfE != "Optimal")
+
+all_stock_plot <- ggplot(data = DFsimulation_enf) +
+  geom_line(aes(x = time, y = xsim, color = enfE), size = 1.5) +
+  xlab("Year") +
+  ylab("Stock (MT)") +
+  scale_y_continuous(label = comma) +
+  scale_color_viridis_d(direction = -1, option = "D") +
+  guides(colour = guide_legend(reverse=T)) +
+  labs(color = "Enforcement Level") +
+  ggtitle(stringr::str_wrap("Yellowfin Tuna Stocks Under Varying Levels of Enforcement", width = 30)) +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5, size = 20),
+        axis.title.x = element_text(size = 18),  # X-axis title size
+        axis.title.y = element_text(size = 18),  # Y-axis title size
+        axis.text.x = element_text(size = 12),   # X-axis labels size
+        axis.text.y = element_text(size = 12)) + #,   # Y-axis labels size
+  guides(color = FALSE)
+        # legend.title = element_text(size = 16),  # Legend title size
+        # legend.text = element_text(size = 12))
+
+all_stock_plot
+
+# all_stock_plot_final <- plot_grid(all_stock_plot,
+#           ncol = 1,
+#           nrow = 1,
+#           labels = c("D"),
+#           label_fontfamily = "calibri",
+#           label_fontface = "plain")
+# 
+# all_stock_plot_final
+```
+
+
+#### All  Harvests
+
+```{r}
+all_stock_plot <- ggplot(data = DFsimulation_enf) +
+  geom_line(aes(x = time, y = hsim, color = enfE), size = 1) +
+  xlab("Year") +
+  ylab("Harvest (MT)") +
+  scale_y_continuous(label = comma) +
+  scale_color_viridis_d(direction = -1, option = "D") +
+  guides(colour = guide_legend(reverse=T)) +
+  labs(color = "Enforcement Level") +
+  ggtitle(stringr::str_wrap("Yellowfin Tuna Harvest Under Varying Levels of Enforcement", width = 30)) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+all_stock_plot
+```
+
+#### Optimal E
+
+```{r}
+# harvest_range = c(0, 650000)
+# 
+# e_opt_plot <- ggplot(data = DFsimulation) +
+#   geom_line(aes(x = time, y = xsim), color = "skyblue", size = 1) +
+#   geom_line(aes(x = time, y = hsim), color = "deeppink4", size = 1) +
+#   xlab("Year") +
+#   scale_y_continuous(name = "Stock (MT)", label = comma,
+#                      sec.axis = sec_axis(~., name="Harvest (MT)", breaks = harvest_range, label = comma)) +
+#   theme(axis.title.y = element_text(color = "skyblue", size=13),
+#     axis.title.y.right = element_text(color = "deeppink4", size=13)) +
+#   theme_minimal()
+# 
+# e_opt_plot
+
+sum(DFsimulation$illegal + DFsimulation$legal)
+
+DFsimulation_p <- DFsimulation %>% select(time, illegal, legal) %>% 
+  pivot_longer(-time, names_to = "harvest_type", values_to = "harvest")
+
+e_opt_plot <- ggplot(data = DFsimulation_p) +
+  geom_col(aes(x = time, y = harvest, fill = harvest_type)) +
+  scale_fill_manual(values = c("legal" = "#336e94", "illegal" = "firebrick4"),
+                    labels = c("Illegal Harvest", "Legal Harvest")) +
+  scale_y_continuous(limits = c(0, 650000), label = comma) +
+  labs(x = "Year", y = "Harvest (MT)") +
+  ggtitle("Optimal Harvest Intensity \n (Total = 2,145,349 MT)") +
+  theme_minimal() +
+  theme(legend.title = element_blank()) +
+  theme(plot.title = element_text(hjust = 0.5))
+
+
+e_opt_plot
+
+e_opt_plot_final <- plot_grid(e_opt_plot,
+          ncol = 1,
+          nrow = 1,
+          # labels = c("E"),
+          label_fontfamily = "calibri",
+          label_fontface = "plain")
+
+e_opt_plot_final
+```
+
+#### Enforcement = 0
+
+```{r}
+sum(DFsimulation_0e$illegal + DFsimulation_0e$legal)
+
+DFsimulation_0e_p <- DFsimulation_0e %>% select(time, illegal, legal) %>% 
+  pivot_longer(-time, names_to = "harvest_type", values_to = "harvest")
+
+e_0_plot <- ggplot(data = DFsimulation_0e_p) +
+  geom_col(aes(x = time, y = harvest, fill = harvest_type)) +
+  scale_fill_manual(values = c("legal" = "#336e94", "illegal" = "firebrick4"),
+                    labels = c("Illegal Harvest", "Legal Harvest")) +
+  scale_y_continuous(limits = c(0, 650000), label = comma) +
+  labs(x = "Year", y = "Harvest (MT)") +
+  ggtitle("Harvest Intensity with No Enforcement \n (Total = 1,111,129 MT)") +
+theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5, size = 20),
+        axis.title.x = element_text(size = 18),
+        axis.title.y = element_text(size = 18),
+        axis.text.x = element_text(size = 12),
+        axis.text.y = element_text(size = 12)) +
+  guides(fill = FALSE)
+
+e_0_plot
+
+e_0_plot_final <- plot_grid(e_0_plot,
+          ncol = 1,
+          nrow = 1,
+          # labels = c("F"),
+          label_fontfamily = "calibri",
+          label_fontface = "plain")
+
+e_0_plot_final
+```
+
+
+
+#### Enforcement = 0.25
+
+```{r}
+sum(DFsimulation_0.25e$illegal + DFsimulation_0.25e$legal)
+
+DFsimulation_0.25e_p <- DFsimulation_0.25e %>% select(time, illegal, legal) %>% 
+  pivot_longer(-time, names_to = "harvest_type", values_to = "harvest")
+
+e_0.25_plot <- ggplot(data = DFsimulation_0.25e_p) +
+  geom_col(aes(x = time, y = harvest, fill = harvest_type)) +
+  scale_fill_manual(values = c("legal" = "#336e94", "illegal" = "firebrick4"),
+                    labels = c("Illegal Harvest", "Legal Harvest")) +
+  scale_y_continuous(limits = c(0, 650000), label = comma) +
+  labs(x = "Year", y = "Harvest (MT)") +
+  ggtitle("Harvest Intensity at 25% Enforcement \n (Total = 1,362,307 MT)") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5, size = 20),
+        axis.title.x = element_text(size = 18),
+        axis.title.y = element_text(size = 18),
+        axis.text.x = element_text(size = 12),
+        axis.text.y = element_text(size = 12)) +
+  guides(fill = FALSE)
+
+
+e_0.25_plot
+
+e_0.25_plot_final <- plot_grid(e_0.25_plot,
+          ncol = 1,
+          nrow = 1,
+          # labels = c("G"),
+          label_fontfamily = "calibri",
+          label_fontface = "plain")
+
+e_0.25_plot_final
+```
+
+#### Enforcement = 0.5
+```{r}
+sum(DFsimulation_0.5e$illegal + DFsimulation_0.5e$legal)
+
+DFsimulation_0.5e_p <- DFsimulation_0.5e %>% select(time, illegal, legal) %>% 
+  pivot_longer(-time, names_to = "harvest_type", values_to = "harvest")
+
+e_0.5_plot <- ggplot(data = DFsimulation_0.5e_p) +
+  geom_col(aes(x = time, y = harvest, fill = harvest_type)) +
+  scale_fill_manual(values = c("legal" = "#336e94", "illegal" = "firebrick4"),
+                    labels = c("Illegal Harvest", "Legal Harvest")) +
+  scale_y_continuous(limits = c(0, 650000), label = comma) +
+  labs(x = "Year", y = "Harvest (MT)") +
+  ggtitle("Harvest Intensity at 50% Enforcement \n (Total = 1,889,212 MT)") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5, size = 20),
+        axis.title.x = element_text(size = 18),
+        axis.title.y = element_text(size = 18),
+        axis.text.x = element_text(size = 12),
+        axis.text.y = element_text(size = 12)) +
+  guides(fill = FALSE)
+
+
+e_0.5_plot
+
+e_0.5_plot_final <- plot_grid(e_0.5_plot,
+          ncol = 1,
+          nrow = 1,
+          # labels = c("H"),
+          label_fontfamily = "calibri",
+          label_fontface = "plain")
+
+e_0.5_plot_final
+```
+
+
+#### Enforcement = 0.75
+
+```{r}
+sum(DFsimulation_0.75e$illegal + DFsimulation_0.75e$legal)
+
+DFsimulation_0.75e_p <- DFsimulation_0.75e %>% select(time, illegal, legal) %>% 
+  pivot_longer(-time, names_to = "harvest_type", values_to = "harvest")
+
+e_0.75_plot <- ggplot(data = DFsimulation_0.75e_p) +
+  geom_col(aes(x = time, y = harvest, fill = harvest_type)) +
+  scale_fill_manual(values = c("legal" = "#336e94", "illegal" = "firebrick4"),
+                    labels = c("Illegal Harvest", "Legal Harvest")) +
+  scale_y_continuous(limits = c(0, 650000), label = comma) +
+  labs(x = "Year", y = "Harvest (MT)") +
+  ggtitle("Harvest Intensity at 75% Enforcement \n (Total = 2,217,507 MT)") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5, size = 20),
+        axis.title.x = element_text(size = 18),
+        axis.title.y = element_text(size = 18),
+        axis.text.x = element_text(size = 12),
+        axis.text.y = element_text(size = 12)) +
+  guides(fill = FALSE)
+
+
+e_0.75_plot
+
+e_0.75_plot_final <- plot_grid(e_0.75_plot,
+          ncol = 1,
+          nrow = 1,
+          # labels = c("I"),
+          label_fontfamily = "calibri",
+          label_fontface = "plain")
+
+e_0.75_plot_final
+```
+
+
+#### Enforcement = 1
+```{r}
+sum(DFsimulation_1e$illegal + DFsimulation_1e$legal)
+
+DFsimulation_1e_p <- DFsimulation_1e %>% select(time, illegal, legal) %>% 
+  pivot_longer(-time, names_to = "harvest_type", values_to = "harvest")
+
+e_1_plot <- ggplot(data = DFsimulation_1e_p) +
+  geom_col(aes(x = time, y = harvest, fill = harvest_type)) +
+  scale_fill_manual(values = c("legal" = "#336e94", "illegal" = "firebrick4"),
+                    labels = c("Illegal Harvest", "Legal Harvest")) +
+  scale_y_continuous(limits = c(0, 650000), label = comma) +
+  labs(x = "Year", y = "Harvest (MT)") +
+  ggtitle("Harvest Intensity with Full Enforcement \n (Total = 2,145,349 MT)") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5, size = 20),
+        axis.title.x = element_text(size = 18),
+        axis.title.y = element_text(size = 18),
+        axis.text.x = element_text(size = 12),
+        axis.text.y = element_text(size = 12)) +
+  guides(fill = FALSE)
+
+
+e_1_plot
+
+e_1_plot_final <- plot_grid(e_1_plot,
+          ncol = 1,
+          nrow = 1,
+          # labels = c("J"),
+          label_fontfamily = "calibri",
+          label_fontface = "plain")
+
+e_1_plot_final
+```
+
+
+#### All Enforcement Harvest
+```{r}
+plot_grid(e_0_plot_final, e_0.25_plot_final, e_0.5_plot_final, e_0.75_plot_final, e_1_plot_final, e_opt_plot_final,
+          labels = c("1", "2", "3", "4", "5", "6"),
+            ncol = 2)
+```
+
+
+### Summary Table
+
+```{r}
+summary_df_2 <- data.frame(
+  Enforcement = c(0, 0.25, 0.5, 0.75, 1, "Optimal"),
+  Stock_start = c(int_stock, int_stock, int_stock, int_stock, int_stock, int_stock),
+  Stock_end = c((1), (3118), (126855), (556055), (914558), (9145697)),
+  Illegal = c(sum(DFsimulation_0e$illegal), sum(DFsimulation_0.25e$illegal), sum(DFsimulation_0.5e$illegal), sum(DFsimulation_0.75e$illegal), sum(DFsimulation_1e$illegal), sum(DFsimulation$illegal)),
+  Legal = c(sum(DFsimulation_0e$legal), sum(DFsimulation_0.25e$legal), sum(DFsimulation_0.5e$legal), sum(DFsimulation_0.75e$legal), sum(DFsimulation_1e$legal), sum(DFsimulation$legal)),
+  Total = c(sum(DFsimulation_0e$total), sum(DFsimulation_0.25e$total), sum(DFsimulation_0.5e$total), sum(DFsimulation_0.75e$total), sum(DFsimulation_1e$total), sum(DFsimulation$total))
+)
+
+summary_df_2 <- summary_df_2 %>% 
+  arrange(Enforcement) %>% 
+  select(-Enforcement, everything()) %>% 
+  rename("Enforcement Level" = Enforcement,
+         "Starting Biomass (MT)" = Stock_start,
+         "Ending Biomass (MT)" = Stock_end,
+         "Illegal Harvest" = Illegal,
+         "Legal Harvest" = Legal,
+         "Total Harvest (MT)" = Total)
+
+summary_df_last <- summary_df_2 %>% 
+  mutate(`Illegal Harvest` = paste0(round(`Illegal Harvest`/`Total Harvest (MT)`*100, digits = 2), "%")) %>% 
+  mutate(`Legal Harvest` = paste0(round(`Legal Harvest`/`Total Harvest (MT)`*100, digits = 2), "%"))
+
+
+summary_df_final <- summary_df_last %>%
+  kbl(caption = "Stock Dynamics and Harvest Across Different Enforcement Levels") %>%
+  kable_classic(full_width = F, html_font = "Calibri", position = "left") %>% 
+  column_spec(ncol(summary_df_last), bold = TRUE) %>% 
+  row_spec(6, color = "skyblue")
+  
+  kable(summary_df_2, caption = "Stock Dynamics and Harvest Across Different Enforcement Levels")
+```
+
+```{r}
+summary_df_final
+```
